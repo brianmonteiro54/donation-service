@@ -74,7 +74,7 @@ func TestDonationHandler_POST_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("falha ao criar sqlmock: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	rows := sqlmock.NewRows([]string{"id", "created_at"}).AddRow(42, time.Now())
 	mock.ExpectQuery("INSERT INTO donations").
@@ -132,7 +132,7 @@ func TestDonationHandler_POST_DBError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("falha ao criar sqlmock: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	mock.ExpectQuery("INSERT INTO donations").
 		WillReturnError(errors.New("conexão recusada"))
@@ -153,7 +153,7 @@ func TestDonationHandler_POST_DBError(t *testing.T) {
 func TestDonationHandler_POST_WithoutSQS(t *testing.T) {
 	// Quando SqsClient é nil, a doação deve ser salva mas nenhum evento publicado.
 	db, mock, _ := sqlmock.New()
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	rows := sqlmock.NewRows([]string{"id", "created_at"}).AddRow(1, time.Now())
 	mock.ExpectQuery("INSERT INTO donations").WillReturnRows(rows)
@@ -177,7 +177,7 @@ func TestDonationHandler_POST_WithoutSQS(t *testing.T) {
 
 func TestDonationHandler_GET_ReturnsList(t *testing.T) {
 	db, mock, _ := sqlmock.New()
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	rows := sqlmock.NewRows([]string{"id", "ngo_id", "amount", "donor_name", "status", "created_at"}).
 		AddRow(1, 1, 100.00, "João", "APPROVED", time.Now()).

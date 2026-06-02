@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -104,7 +106,89 @@ func initOTel(ctx context.Context) (func(), error) {
 	}, nil
 }
 
-func main() {
+// getPort retorna a porta de escuta a partir da env PORT (default 8082).
+func getPort() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8082"
+	}
+	return port
+}
+
+// newSQSClient cria um cliente SQS quando queueURL e region estão definidos.
+// Retorna (nil, nil) quando a integração não está configurada (comportamento
+// idêntico ao original, em que o cliente permanecia nil).
+func newSQSClient(ctx context.Context, queueURL, region, endpoint string) (SQSAPI, error) {
+	if queueURL == "" || region == "" {
+		return nil, nil
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao carregar config AWS: %w", err)
+	}
+
+	// Opções do cliente SQS - aponta para LocalStack quando endpoint customizado for definido
+	client := sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+			log.Printf("Integração com SQS ativada via endpoint customizado: %s", endpoint)
+		} else {
+			log.Println("Integração com AWS SQS (produção) ativada.")
+		}
+	})
+	return client, nil
+}
+
+// buildApp monta a App a partir da configuração do ambiente. Abre o pool do
+// banco (lazy, sem estabelecer conexão) e configura o cliente SQS opcional.
+func buildApp(ctx context.Context) (*App, error) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		return nil, errors.New("DATABASE_URL é obrigatória")
+	}
+
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao abrir conexão com o banco: %w", err)
+	}
+
+	// ---- AWS SDK v2 ----
+	queueURL := os.Getenv("AWS_SQS_URL")
+	region := os.Getenv("AWS_REGION")
+	endpoint := os.Getenv("AWS_ENDPOINT_URL") // Para LocalStack em ambiente local
+
+	sqsClient, err := newSQSClient(ctx, queueURL, region, endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	return &App{DB: db, SqsClient: sqsClient, SqsQueueURL: queueURL}, nil
+}
+
+// Router constrói o handler HTTP com as rotas, /metrics e a instrumentação OTel.
+func (a *App) Router() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", a.HealthHandler)
+	mux.HandleFunc("/donations", a.DonationHandler)
+
+	// Expõe /metrics para o Prometheus (ServiceMonitor faz scrape aqui)
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Wrap com OTel para gerar spans das requisições HTTP
+	return otelhttp.NewHandler(mux, "donation-service")
+}
+
+// Serve inicia o servidor HTTP na porta informada (chamada bloqueante).
+func (a *App) Serve(port string) error {
+	log.Printf("donation-service rodando na porta %s", port)
+	return http.ListenAndServe(":"+port, a.Router())
+}
+
+// run concentra a lógica de inicialização para permitir testes; main apenas a invoca.
+func run() error {
 	_ = godotenv.Load()
 	ctx := context.Background()
 
@@ -115,65 +199,28 @@ func main() {
 		defer cleanup()
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8082"
-	}
-
-	// ---- Banco de Dados ----
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL é obrigatória")
-	}
-
-	db, err := sql.Open("pgx", dbURL)
+	app, err := buildApp(ctx)
 	if err != nil {
-		log.Fatalf("Erro ao abrir conexão com o banco: %v", err)
+		return err
 	}
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Erro ao pingar o banco: %v", err)
+	defer func() {
+		if cerr := app.DB.Close(); cerr != nil {
+			log.Printf("Erro ao fechar conexão com o banco: %v", cerr)
+		}
+	}()
+
+	if err := app.DB.Ping(); err != nil {
+		return fmt.Errorf("erro ao pingar o banco: %w", err)
 	}
 	log.Println("Conectado ao PostgreSQL (donation-service).")
 
-	// ---- AWS SDK v2 ----
-	var sqsClient *sqs.Client
-	queueURL := os.Getenv("AWS_SQS_URL")
-	region := os.Getenv("AWS_REGION")
-	endpoint := os.Getenv("AWS_ENDPOINT_URL") // Para LocalStack em ambiente local
+	return app.Serve(getPort())
+}
 
-	if queueURL != "" && region != "" {
-		cfg, err := config.LoadDefaultConfig(ctx,
-			config.WithRegion(region),
-		)
-		if err != nil {
-			log.Fatalf("Erro ao carregar config AWS: %v", err)
-		}
-
-		// Opções do cliente SQS - aponta para LocalStack quando endpoint customizado for definido
-		sqsClient = sqs.NewFromConfig(cfg, func(o *sqs.Options) {
-			if endpoint != "" {
-				o.BaseEndpoint = aws.String(endpoint)
-				log.Printf("Integração com SQS ativada via endpoint customizado: %s", endpoint)
-			} else {
-				log.Println("Integração com AWS SQS (produção) ativada.")
-			}
-		})
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
-
-	app := &App{DB: db, SqsClient: sqsClient, SqsQueueURL: queueURL}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", app.HealthHandler)
-	mux.HandleFunc("/donations", app.DonationHandler)
-
-	// Expõe /metrics para o Prometheus (ServiceMonitor faz scrape aqui)
-	mux.Handle("/metrics", promhttp.Handler())
-
-	// Wrap com OTel para gerar spans das requisições HTTP
-	handler := otelhttp.NewHandler(mux, "donation-service")
-
-	log.Printf("donation-service rodando na porta %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
 
 func (a *App) HealthHandler(w http.ResponseWriter, r *http.Request) {
