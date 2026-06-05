@@ -26,7 +26,6 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: solidarytech/${{ github.event.repository.name }}
   IMAGE_TAG: ${{ github.sha }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MIN_COVERAGE: "80"
 
 jobs:
