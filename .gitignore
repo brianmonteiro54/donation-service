@@ -22,11 +22,6 @@ coverage.out
 coverage.html
 .go-build/
 
-# go.sum é gerado pelo `go mod tidy` durante o build do Docker.
-# Decisão: NÃO commitar (mantemos o go.mod enxuto e o tidy resolve).
-# Se quiser builds 100% reprodutíveis em CI, comente a linha abaixo.
-donation-service/go.sum
-
 # =============================================================================
 # Docker / IDE / SO
 # =============================================================================
